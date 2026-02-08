@@ -63,7 +63,7 @@ bool settings_exist = false;
 
 // ----- API Configuration -----
 const char *API_HOST = "api1.raildata.org.uk";
-const char *API_BASE = "/1010-live-departure-board-dep/LDBWS/api/20220120/GetDepBoardWithDetails";
+const char *API_BASE = "/1010-live-departure-board-dep1_2/LDBWS/api/20220120/GetDepBoardWithDetails";
 
 // Station CRS codes
 const char *STATION_LUT = "LUT";  // Luton
