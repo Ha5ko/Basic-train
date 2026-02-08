@@ -1,19 +1,27 @@
 /*
  * ESP32-4848S040 - V4: Persistent Settings (NVS)
  *
- * Saves WiFi SSID, password, and API key to ESP32 flash (NVS).
- * On boot, loads saved settings and connects to WiFi.
- * Touch the "RESET SETTINGS" button to clear saved data.
+ * On first boot (no saved settings):
+ *   - Screen prompts you to open Serial Monitor
+ *   - You type your WiFi SSID, password, and API key via Serial
+ *   - Device saves them to flash (NVS) and connects
  *
- * For first test: edit INITIAL_SSID, INITIAL_PASS, INITIAL_API_KEY
- * below. They will be saved to NVS on first boot, then loaded
- * from flash on subsequent boots (survives power cycles).
+ * On subsequent boots:
+ *   - Loads credentials from flash automatically
+ *   - Connects to WiFi without asking
+ *
+ * Touch "RESET SETTINGS" button to clear saved data and re-enter.
+ *
+ * Serial input format (in Serial Monitor, set line ending to "Newline"):
+ *   Step 1: type SSID, press Enter
+ *   Step 2: type password, press Enter
+ *   Step 3: type API key, press Enter
  *
  * Required Libraries:
  *   - Arduino_GFX-master  (from manufacturer)
  *   - Touch_GT911         (from manufacturer)
  *
- * Board Settings: same as V1/V2/V3
+ * Board Settings: same as V1/V2
  */
 
 #include <Arduino_GFX_Library.h>
@@ -21,15 +29,6 @@
 #include <Touch_GT911.h>
 #include <WiFi.h>
 #include <Preferences.h>  // ESP32 NVS library (built-in)
-
-// ============================================================
-// >>> INITIAL VALUES - only used on very first boot <<<
-// >>> After first boot, values are loaded from NVS <<<
-// ============================================================
-#define INITIAL_SSID    "YOUR_WIFI_SSID"
-#define INITIAL_PASS    "YOUR_WIFI_PASSWORD"
-#define INITIAL_API_KEY "YOUR_DARWIN_API_KEY"
-// ============================================================
 
 // ----- Display Setup -----
 #define GFX_BL 38
@@ -53,35 +52,33 @@ Touch_GT911 touch(19, 45, -1, -1, 480, 480);
 // ----- NVS Storage -----
 Preferences prefs;
 
-// Settings stored in NVS
+// Settings
 String saved_ssid;
 String saved_pass;
 String saved_api_key;
 bool settings_exist = false;
-
-// UI state
 bool is_connected = false;
 
 // Reset button bounds
 #define BTN_X 140
-#define BTN_Y 400
+#define BTN_Y 410
 #define BTN_W 200
 #define BTN_H 50
 
 // ----- NVS Functions -----
 
-void saveSettings(const char *ssid, const char *pass, const char *apiKey) {
-    prefs.begin("trainboard", false);  // namespace "trainboard", read-write
+void saveSettings(const String &ssid, const String &pass, const String &apiKey) {
+    prefs.begin("trainboard", false);
     prefs.putString("ssid", ssid);
     prefs.putString("pass", pass);
     prefs.putString("apikey", apiKey);
     prefs.putBool("configured", true);
     prefs.end();
-    Serial.println("Settings saved to NVS");
+    Serial.println("Settings saved to NVS!");
 }
 
 bool loadSettings() {
-    prefs.begin("trainboard", true);  // read-only
+    prefs.begin("trainboard", true);
     bool configured = prefs.getBool("configured", false);
     if (configured) {
         saved_ssid = prefs.getString("ssid", "");
@@ -96,7 +93,7 @@ void clearSettings() {
     prefs.begin("trainboard", false);
     prefs.clear();
     prefs.end();
-    Serial.println("Settings cleared from NVS");
+    Serial.println("Settings cleared from NVS!");
 }
 
 // ----- Display Functions -----
@@ -129,7 +126,6 @@ void drawStatus(const char *msg, uint16_t color) {
 }
 
 void drawResetButton() {
-    // Draw button
     gfx->fillRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, 8, RED);
     gfx->drawRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, 8, WHITE);
     gfx->setTextSize(2);
@@ -138,37 +134,140 @@ void drawResetButton() {
     gfx->print("RESET SETTINGS");
 }
 
-// Mask a string for display (show first 3 chars, rest as *)
 String maskString(const String &s) {
     if (s.length() <= 3) return s;
     String masked = s.substring(0, 3);
-    for (int i = 3; i < s.length() && i < 20; i++) masked += '*';
+    for (unsigned int i = 3; i < s.length() && i < 20; i++) masked += '*';
     return masked;
 }
 
-void drawSettingsInfo() {
-    // Source
-    const char *source = settings_exist ? "Loaded from NVS (flash)" : "Using initial values";
-    uint16_t source_color = settings_exist ? GREEN : YELLOW;
-    drawField(100, "Source:", source, source_color);
+// ----- Serial Input for Setup -----
 
-    // SSID
-    drawField(140, "SSID:", saved_ssid.c_str(), WHITE);
+String readSerialLine() {
+    String input = "";
+    while (true) {
+        // Also check for touch reset during serial input
+        touch.read();
+        if (touch.isTouched) {
+            int x = map(touch.points[0].x, 480, 0, 0, 479);
+            int y = map(touch.points[0].y, 480, 0, 0, 479);
+            if (x >= BTN_X && x <= BTN_X + BTN_W &&
+                y >= BTN_Y && y <= BTN_Y + BTN_H) {
+                // Ignore during setup
+            }
+        }
 
-    // Password (masked)
-    String masked_pass = maskString(saved_pass);
-    drawField(180, "Password:", masked_pass.c_str(), 0x7BEF);
-
-    // API Key (masked)
-    String masked_key = maskString(saved_api_key);
-    drawField(220, "API Key:", masked_key.c_str(), 0x7BEF);
+        if (Serial.available()) {
+            char c = Serial.read();
+            if (c == '\n' || c == '\r') {
+                if (input.length() > 0) {
+                    return input;
+                }
+                // Skip empty lines (handles \r\n)
+                continue;
+            }
+            input += c;
+        }
+        delay(10);
+    }
 }
 
-void drawWifiStatus() {
-    if (WiFi.isConnected()) {
+void runSerialSetup() {
+    drawStatus("Setup required - open Serial Monitor", YELLOW);
+
+    gfx->setTextSize(2);
+    gfx->setTextColor(WHITE);
+    gfx->setCursor(20, 110);
+    gfx->print("No saved settings found.");
+
+    gfx->setTextColor(CYAN);
+    gfx->setCursor(20, 150);
+    gfx->print("Open Arduino Serial Monitor");
+    gfx->setCursor(20, 175);
+    gfx->print("(115200 baud, Newline ending)");
+
+    gfx->setTextColor(YELLOW);
+    gfx->setCursor(20, 215);
+    gfx->print("Then follow the prompts to");
+    gfx->setCursor(20, 240);
+    gfx->print("enter your credentials.");
+
+    gfx->setTextColor(0x7BEF);
+    gfx->setCursor(20, 290);
+    gfx->print("Waiting for Serial input...");
+
+    // Prompt 1: SSID
+    Serial.println();
+    Serial.println("=== ESP32 Train Board Setup ===");
+    Serial.println();
+    Serial.println("Step 1/3: Enter your WiFi SSID:");
+    saved_ssid = readSerialLine();
+    Serial.printf("  SSID set to: %s\n", saved_ssid.c_str());
+    drawField(330, "SSID:", saved_ssid.c_str(), GREEN);
+
+    // Prompt 2: Password
+    Serial.println();
+    Serial.println("Step 2/3: Enter your WiFi password:");
+    saved_pass = readSerialLine();
+    Serial.println("  Password set.");
+    drawField(360, "Password:", maskString(saved_pass).c_str(), GREEN);
+
+    // Prompt 3: API Key
+    Serial.println();
+    Serial.println("Step 3/3: Enter your Darwin API key:");
+    saved_api_key = readSerialLine();
+    Serial.println("  API key set.");
+    drawField(390, "API Key:", maskString(saved_api_key).c_str(), GREEN);
+
+    // Save to NVS
+    saveSettings(saved_ssid, saved_pass, saved_api_key);
+
+    Serial.println();
+    Serial.println("All settings saved to flash!");
+    Serial.println("These will persist across power cycles.");
+    Serial.println();
+
+    settings_exist = true;
+}
+
+// ----- WiFi Connection -----
+
+void connectWifi() {
+    drawStatus("Connecting to WiFi...", YELLOW);
+    Serial.printf("Connecting to '%s'...\n", saved_ssid.c_str());
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(saved_ssid.c_str(), saved_pass.c_str());
+    WiFi.setAutoReconnect(true);
+
+    int attempts = 0;
+    while (!WiFi.isConnected() && attempts < 40) {
+        delay(500);
+        Serial.print(".");
+        int dotX = 20 + (attempts % 20) * 22;
+        gfx->fillCircle(dotX, 95, 4, (attempts % 2) ? YELLOW : 0x4208);
+        attempts++;
+    }
+    gfx->fillRect(0, 88, 480, 16, BLACK);
+    Serial.println();
+
+    is_connected = WiFi.isConnected();
+}
+
+void drawConnectedScreen() {
+    // Clear the setup area
+    gfx->fillRect(0, 55, 480, 350, BLACK);
+
+    if (is_connected) {
         drawStatus("WiFi Connected!", GREEN);
 
         char buf[64];
+
+        drawField(110, "Source:", settings_exist ? "Loaded from NVS (flash)" : "Fresh setup", GREEN);
+        drawField(150, "SSID:", saved_ssid.c_str(), WHITE);
+        drawField(190, "Password:", maskString(saved_pass).c_str(), 0x7BEF);
+        drawField(230, "API Key:", maskString(saved_api_key).c_str(), 0x7BEF);
+
         snprintf(buf, sizeof(buf), "%s", WiFi.localIP().toString().c_str());
         drawField(280, "IP:", buf, GREEN);
 
@@ -182,36 +281,12 @@ void drawWifiStatus() {
         snprintf(buf, sizeof(buf), "%d dBm (%s)", rssi, quality);
         drawField(320, "Signal:", buf, color);
 
-        // Confirmation that NVS works
-        drawField(360, "NVS:", "Settings persist across reboots!", GREEN);
+        drawField(370, "NVS:", "Settings persist across reboots!", GREEN);
     } else {
-        drawStatus("WiFi Connection Failed", RED);
-        drawField(280, "Check:", "SSID and password", YELLOW);
+        drawStatus("WiFi Connection FAILED", RED);
+        drawField(110, "SSID:", saved_ssid.c_str(), RED);
+        drawField(150, "Tip:", "Touch RESET to re-enter creds", YELLOW);
     }
-}
-
-void connectWifi() {
-    drawStatus("Connecting to WiFi...", YELLOW);
-
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(saved_ssid.c_str(), saved_pass.c_str());
-    WiFi.setAutoReconnect(true);
-
-    Serial.printf("Connecting to '%s'...\n", saved_ssid.c_str());
-
-    int attempts = 0;
-    while (!WiFi.isConnected() && attempts < 40) {
-        delay(500);
-        Serial.print(".");
-        // Progress dots
-        int dotX = 20 + (attempts % 20) * 22;
-        gfx->fillCircle(dotX, 270, 4, (attempts % 2) ? YELLOW : 0x4208);
-        attempts++;
-    }
-    gfx->fillRect(0, 260, 480, 20, BLACK);
-
-    Serial.println();
-    is_connected = WiFi.isConnected();
 }
 
 // ----- Main -----
@@ -236,33 +311,24 @@ void setup() {
     // Try to load settings from NVS
     settings_exist = loadSettings();
 
-    if (settings_exist) {
+    if (settings_exist && saved_ssid.length() > 0) {
         Serial.println("Settings loaded from NVS:");
         Serial.printf("  SSID: %s\n", saved_ssid.c_str());
         Serial.printf("  API Key: %s...\n", saved_api_key.substring(0, 8).c_str());
     } else {
-        Serial.println("No saved settings found. Using initial values.");
-        saved_ssid = INITIAL_SSID;
-        saved_pass = INITIAL_PASS;
-        saved_api_key = INITIAL_API_KEY;
-
-        // Save initial values to NVS
-        saveSettings(saved_ssid.c_str(), saved_pass.c_str(), saved_api_key.c_str());
-        settings_exist = true;  // Now they exist
+        // No settings - run serial setup
+        settings_exist = false;
+        runSerialSetup();
     }
-
-    // Show settings info
-    drawSettingsInfo();
 
     // Connect to WiFi
     connectWifi();
-    drawWifiStatus();
-
-    // Draw reset button
+    drawConnectedScreen();
     drawResetButton();
 
-    Serial.println("V4: Ready! Touch RESET SETTINGS to clear NVS.");
-    Serial.println("Power cycle the device to test NVS persistence.");
+    Serial.println("V4: Ready!");
+    Serial.println("Touch RESET SETTINGS to clear saved data and re-enter.");
+    Serial.println("Power cycle to verify NVS persistence.");
 }
 
 void loop() {
@@ -284,20 +350,27 @@ void loop() {
 
             // Clear NVS
             clearSettings();
+            settings_exist = false;
 
             // Update display
             gfx->fillRect(0, 55, 480, 350, BLACK);
             drawStatus("Settings CLEARED!", YELLOW);
-            drawField(140, "Action:", "NVS wiped", RED);
-            drawField(180, "Next:", "Reboot to use INITIAL values", YELLOW);
-            drawField(220, "Or:", "Upload new code with new values", 0x7BEF);
+            drawField(150, "Action:", "NVS wiped", RED);
+            drawField(190, "Next:", "Device will reboot in 3s...", YELLOW);
 
-            // Redraw button
-            drawResetButton();
-
-            // Debounce
-            delay(1000);
+            delay(3000);
+            ESP.restart();
         }
+    }
+
+    // Detect WiFi reconnect/disconnect
+    static bool prev_connected = is_connected;
+    bool now_connected = WiFi.isConnected();
+    if (now_connected != prev_connected) {
+        is_connected = now_connected;
+        drawConnectedScreen();
+        drawResetButton();
+        prev_connected = now_connected;
     }
 
     delay(50);
